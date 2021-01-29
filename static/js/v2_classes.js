@@ -1,13 +1,12 @@
 const Protocols = {
     VMESS: 'vmess',
     VLESS: 'vless',
+    TROJAN: 'trojan',
     SHADOWSOCKS: 'shadowsocks',
     DOKODEMO: 'dokodemo-door',
     MTPROTO: 'mtproto',
     SOCKS: 'socks',
     HTTP: 'http',
-    FREEDOM: 'freedom',
-    BLACKHOLE: 'blackhole',
 };
 
 const VmessMethods = {
@@ -18,10 +17,10 @@ const VmessMethods = {
 };
 
 const SSMethods = {
-    AES_256_CFB: 'aes-256-cfb',
-    AES_128_CFB: 'aes-128-cfb',
-    CHACHA20: 'chacha20',
-    CHACHA20_IETF: 'chacha20-ietf',
+    // AES_256_CFB: 'aes-256-cfb',
+    // AES_128_CFB: 'aes-128-cfb',
+    // CHACHA20: 'chacha20',
+    // CHACHA20_IETF: 'chacha20-ietf',
     CHACHA20_POLY1305: 'chacha20-poly1305',
     AES_256_GCM: 'aes-256-gcm',
     AES_128_GCM: 'aes-128-gcm',
@@ -244,6 +243,7 @@ class KcpStreamSettings extends V2CommonClass {
                 readBufferSize=2,
                 writeBufferSize=2,
                 type='none',
+                seed=randomSeq(10),
                 ) {
         super();
         this.mtu = mtu;
@@ -254,6 +254,7 @@ class KcpStreamSettings extends V2CommonClass {
         this.readBuffer = readBufferSize;
         this.writeBuffer = writeBufferSize;
         this.type = type;
+        this.seed = seed;
     }
 
     static fromJson(json={}) {
@@ -266,6 +267,7 @@ class KcpStreamSettings extends V2CommonClass {
             json.readBufferSize,
             json.writeBufferSize,
             isEmpty(json.header) ? 'none' : json.header.type,
+            json.seed,
         );
     }
 
@@ -281,6 +283,7 @@ class KcpStreamSettings extends V2CommonClass {
             header: {
                 type: this.type,
             },
+            seed: this.seed,
         };
     }
 }
@@ -378,11 +381,9 @@ class QuicStreamSettings extends V2CommonClass {
 
 class TlsStreamSettings extends V2CommonClass {
     constructor(serverName='',
-                allowInsecure=true,
                 certificates=[new TlsStreamSettings.Cert()]) {
         super();
         this.server = serverName;
-        this.allowInsecure = allowInsecure;
         this.certs = certificates;
     }
 
@@ -401,7 +402,6 @@ class TlsStreamSettings extends V2CommonClass {
         }
         return new TlsStreamSettings(
             json.serverName,
-            json.allowInsecure,
             certs,
         );
     }
@@ -409,7 +409,6 @@ class TlsStreamSettings extends V2CommonClass {
     toJson() {
         return {
             serverName: this.server,
-            allowInsecure: this.allowInsecure,
             certificates: TlsStreamSettings.toJsonArray(this.certs),
         };
     }
@@ -584,6 +583,7 @@ class Inbound extends V2CommonClass {
         } else if (network === 'kcp') {
             let kcp = this.stream.kcp;
             type = kcp.type;
+            path = kcp.seed;
         } else if (network === 'ws') {
             let ws = this.stream.ws;
             path = ws.path;
@@ -623,16 +623,102 @@ class Inbound extends V2CommonClass {
         return 'vmess://' + Inbound.base64(JSON.stringify(obj, null, 2));
     }
 
+    genVLESSLink(address = '') {
+        const settings = this.settings;
+        const uuid = settings.vlesses[0].id;
+        const port = this.port;
+        const type = this.stream.network;
+        const params = new Map();
+        params.set("type", this.stream.network);
+        params.set("security", this.stream.security);
+        switch (type) {
+            case "tcp":
+                const tcp = this.stream.tcp;
+                if (tcp.type === 'http') {
+                    const request = tcp.request;
+                    params.set("path", request.path.join(','));
+                    const index = request.headers.findIndex(header => header.name.toLowerCase() === 'host');
+                    if (index >= 0) {
+                        const host = request.headers[index].value;
+                        params.set("host", host);
+                    }
+                }
+                break;
+            case "kcp":
+                const kcp = this.stream.kcp;
+                params.set("headerType", kcp.type);
+                params.set("seed", kcp.seed);
+                break;
+            case "ws":
+                const ws = this.stream.ws;
+                params.set("path", ws.path);
+                const index = ws.headers.findIndex(header => header.name.toLowerCase() === 'host');
+                if (index >= 0) {
+                    const host = ws.headers[index].value;
+                    params.set("host", host);
+                }
+                break;
+            case "http":
+                const http = this.stream.http;
+                params.set("path", http.path);
+                params.set("host", http.host);
+                break;
+            case "quic":
+                const quic = this.stream.quic;
+                params.set("quicSecurity", quic.security);
+                params.set("key", quic.key);
+                params.set("headerType", quic.type);
+                break;
+        }
+
+        if (this.stream.security === 'tls') {
+            if (!isEmpty(this.stream.tls.server)) {
+                address = this.stream.tls.server;
+                params.set("sni", address);
+            }
+        }
+
+        for (const [key, value] of params) {
+            switch (key) {
+                case "host":
+                case "path":
+                case "seed":
+                case "key":
+                case "alpn":
+                    params.set(key, encodeURIComponent(value));
+                    break;
+            }
+        }
+
+        const link = `vless://${uuid}@${address}:${port}`;
+        const url = new URL(link);
+        for (const [key, value] of params) {
+            url.searchParams.set(key, value)
+        }
+        return url.toString();
+    }
+
     genSSLink(address='') {
         let settings = this.settings;
+        const server = this.stream.tls.server;
+        if (!isEmpty(server)) {
+            address = server;
+        }
         return 'ss://' + Inbound.safeBase64(settings.method + ':' + settings.password + '@' + address + ':' + this.port)
             + '#' + encodeURIComponent(this.remark);
+    }
+
+    genTrojanLink(address='') {
+        let settings = this.settings;
+        return `trojan://${settings.clients[0].password}@${address}:${this.port}#${encodeURIComponent(this.remark)}`;
     }
 
     genLink(address='') {
         switch (this.protocol) {
             case Protocols.VMESS: return this.genVmessLink(address);
+            case Protocols.VLESS: return this.genVLESSLink(address);
             case Protocols.SHADOWSOCKS: return this.genSSLink(address);
+            case Protocols.TROJAN: return this.genTrojanLink(address);
             default: return '';
         }
     }
@@ -653,7 +739,10 @@ class Inbound extends V2CommonClass {
 
     toJson() {
         let streamSettings;
-        if (this.protocol === Protocols.VMESS || this.protocol === Protocols.VLESS) {
+        if (this.protocol === Protocols.VMESS
+            || this.protocol === Protocols.VLESS
+            || this.protocol === Protocols.TROJAN
+            || this.protocol === Protocols.SHADOWSOCKS) {
             streamSettings = this.stream.toJson();
         }
         return {
@@ -680,6 +769,7 @@ Inbound.Settings = class extends V2CommonClass {
         switch (protocol) {
             case Protocols.VMESS: return new Inbound.VmessSettings(protocol);
             case Protocols.VLESS: return new Inbound.VLESSSettings(protocol);
+            case Protocols.TROJAN: return new Inbound.TrojanSettings(protocol);
             case Protocols.SHADOWSOCKS: return new Inbound.ShadowsocksSettings(protocol);
             case Protocols.DOKODEMO: return new Inbound.DokodemoSettings(protocol);
             case Protocols.MTPROTO: return new Inbound.MtprotoSettings(protocol);
@@ -693,6 +783,7 @@ Inbound.Settings = class extends V2CommonClass {
         switch (protocol) {
             case Protocols.VMESS: return Inbound.VmessSettings.fromJson(json);
             case Protocols.VLESS: return Inbound.VLESSSettings.fromJson(json);
+            case Protocols.TROJAN: return Inbound.TrojanSettings.fromJson(json);
             case Protocols.SHADOWSOCKS: return Inbound.ShadowsocksSettings.fromJson(json);
             case Protocols.DOKODEMO: return Inbound.DokodemoSettings.fromJson(json);
             case Protocols.MTPROTO: return Inbound.MtprotoSettings.fromJson(json);
@@ -768,13 +859,11 @@ Inbound.VLESSSettings = class extends Inbound.Settings {
     constructor(protocol,
                 vlesses=[new Inbound.VLESSSettings.VLESS()],
                 decryption='none',
-                fallback=new Inbound.VLESSSettings.Fallback(),
-                fallbackH2=new Inbound.VLESSSettings.FallbackH2()) {
+                fallbacks=[],) {
         super(protocol);
         this.vlesses = vlesses;
         this.decryption = decryption;
-        this.fallback = fallback;
-        this.fallbackH2 = fallbackH2;
+        this.fallbacks = fallbacks;
     }
 
     static fromJson(json={}) {
@@ -782,8 +871,7 @@ Inbound.VLESSSettings = class extends Inbound.Settings {
             Protocols.VLESS,
             json.clients.map(client => Inbound.VLESSSettings.VLESS.fromJson(client)),
             json.decryption,
-            Inbound.VLESSSettings.Fallback.fromJson(json.fallback),
-            Inbound.VLESSSettings.FallbackH2.fromJson(json.fallbackH2),
+            Inbound.VLESSSettings.Fallback.fromJson(json.fallbacks),
         );
     }
 
@@ -791,79 +879,91 @@ Inbound.VLESSSettings = class extends Inbound.Settings {
         return {
             clients: Inbound.VLESSSettings.toJsonArray(this.vlesses),
             decryption: this.decryption,
-            fallback: this.fallback.toJson(),
-            fallbackH2: this.fallbackH2.toJson(),
+            fallbacks: Inbound.VLESSSettings.toJsonArray(this.fallbacks),
         };
     }
 };
 Inbound.VLESSSettings.VLESS = class extends V2CommonClass {
 
-    constructor(id=randomUUID(), encryption='none') {
+    constructor(id=randomUUID()) {
         super();
         this.id = id;
-        this.encryption = encryption;
     }
 
     static fromJson(json={}) {
         return new Inbound.VmessSettings.Vmess(
             json.id,
-            json.encryption,
         );
     }
 };
 Inbound.VLESSSettings.Fallback = class extends V2CommonClass {
-    constructor(addr='127.0.0.1', port=80, unix='', xver=0) {
+    constructor(alpn='', path='', dest='', xver=0) {
         super();
-        this.addr = addr;
-        this.port = port;
-        this.unix = unix;
+        this.alpn = alpn;
+        this.path = path;
+        this.dest = dest;
         this.xver = xver;
     }
 
     toJson() {
         return {
-            addr: this.addr,
-            port: this.port,
-            unix: this.unix,
+            alpn: this.alpn,
+            path: this.path,
+            dest: this.dest,
             xver: this.xver,
         }
     }
 
-    static fromJson(json={}) {
-        return new Inbound.VLESSSettings.Fallback(
-            json.addr,
-            json.port,
-            json.unix,
-            json.xver,
-        )
+    static fromJson(json=[]) {
+        const fallbacks = [];
+        for (let fallback of json) {
+            fallbacks.push(new Inbound.VLESSSettings.Fallback(
+                fallback.alpn,
+                fallback.path,
+                fallback.dest,
+                fallback.xver,
+            ))
+        }
+        return fallbacks;
     }
 };
-Inbound.VLESSSettings.FallbackH2 = class extends V2CommonClass {
-    constructor(addr='127.0.0.1', port=80, unix='', xver=0) {
-        super();
-        this.addr = addr;
-        this.port = port;
-        this.unix = unix;
-        this.xver = xver;
+
+Inbound.TrojanSettings = class extends Inbound.Settings {
+    constructor(protocol, clients=[new Inbound.TrojanSettings.Client()]) {
+        super(protocol);
+        this.clients = clients;
     }
 
     toJson() {
         return {
-            addr: this.addr,
-            port: this.port,
-            unix: this.unix,
-            xver: this.xver,
-        }
+            clients: Inbound.TrojanSettings.toJsonArray(this.clients),
+        };
     }
 
     static fromJson(json={}) {
-        return new Inbound.VLESSSettings.Fallback(
-            json.addr,
-            json.port,
-            json.unix,
-            json.xver,
-        )
+        const clients = [];
+        for (const c of json.clients) {
+            clients.push(Inbound.TrojanSettings.Client.fromJson(c));
+        }
+        return new Inbound.TrojanSettings(Protocols.TROJAN, clients);
     }
+};
+Inbound.TrojanSettings.Client = class extends V2CommonClass {
+    constructor(password=randomSeq(10)) {
+        super();
+        this.password = password;
+    }
+
+    toJson() {
+        return {
+            password: this.password,
+        };
+    }
+
+    static fromJson(json={}) {
+        return new Inbound.TrojanSettings.Client(json.password);
+    }
+
 };
 
 Inbound.ShadowsocksSettings = class extends Inbound.Settings {
